@@ -1,0 +1,11 @@
+{
+  "name": "bisi",
+  "version": "1.0.0",
+  "main": "evet",
+  "scripts": {
+    "start": "node evet"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1"
+  }
+}
