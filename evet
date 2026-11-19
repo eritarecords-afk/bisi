@@ -1,0 +1,1063 @@
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  StringSelectMenuBuilder,
+  ChannelType,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+  ActivityType,
+  ComponentType,
+} = require('discord.js');
+
+// ==================== AYARLAR ====================
+const CONFIG = {
+  TOKEN: 'MTUxMzk5NDk0NTU2MjY3NzMwOA.GPQWpt.O-35yRIA0AHPptuKK4_eYILUHvCnAYDKlBYW8A', // YENİLEDİĞİN TOKENI BURAYA YAZ
+  PREFIX: 'v!',
+  COLOR: '#5865F2',
+  WELCOME_CHANNEL_NAME: 'hoş-geldin',
+  LOG_CHANNEL_NAME: 'viserion-log',
+  // İstersen kanal ID'lerini doğrudan buraya yazabilirsin; boşsa kanal adına göre otomatik bulur
+  CHANNELS: {
+    PARTNER_ID: '1527724433488220350',
+    KALICI_ID: '1527724468355596451',
+    PARTNER_LOG_ID: '1527724527415726232',
+    BLACKLIST_ID: '1527726470934565014',
+  },
+};
+
+// ==================== BELLEK İÇİ VERİTABANI ====================
+const db = {
+  xp: new Map(),                // userId -> { xp, level }
+  economy: new Map(),           // userId -> { balance, lastDaily }
+  warnings: new Map(),          // guildId_userId -> [ { reason, mod, date } ]
+  partnerTimestamps: new Map(), // guildId_userId -> [ timestampMs, ... ]
+  blacklist: new Map(),         // guildId -> Set(lowercaseTerm)
+};
+
+const getXP = (id) => {
+  if (!db.xp.has(id)) db.xp.set(id, { xp: 0, level: 1 });
+  return db.xp.get(id);
+};
+
+const getEco = (id) => {
+  if (!db.economy.has(id)) db.economy.set(id, { balance: 100, lastDaily: 0 });
+  return db.economy.get(id);
+};
+
+const getBlacklist = (guildId) => {
+  if (!db.blacklist.has(guildId)) db.blacklist.set(guildId, new Set());
+  return db.blacklist.get(guildId);
+};
+
+function recordPartnerAndGetStats(guildId, userId) {
+  const key = `${guildId}_${userId}`;
+  const now = Date.now();
+  const list = db.partnerTimestamps.get(key) || [];
+  list.push(now);
+  db.partnerTimestamps.set(key, list);
+
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  const day = new Date();
+  const diffToMonday = (day.getDay() + 6) % 7;
+  const startOfWeek = new Date(day);
+  startOfWeek.setDate(day.getDate() - diffToMonday);
+  startOfWeek.setHours(0, 0, 0, 0);
+
+  const startOfMonth = new Date(day.getFullYear(), day.getMonth(), 1);
+
+  return {
+    today: list.filter(t => t >= startOfDay.getTime()).length,
+    week: list.filter(t => t >= startOfWeek.getTime()).length,
+    month: list.filter(t => t >= startOfMonth.getTime()).length,
+    total: list.length,
+  };
+}
+
+function findBlacklistedTerm(guildId, text) {
+  const set = getBlacklist(guildId);
+  const lower = text.toLowerCase();
+  for (const term of set) {
+    if (term && lower.includes(term)) return term;
+  }
+  return null;
+}
+
+function resolveChannel(guild, explicitId, keywords) {
+  if (explicitId) {
+    const byId = guild.channels.cache.get(explicitId);
+    if (byId && byId.isTextBased()) return byId;
+  }
+  for (const kw of keywords) {
+    const found = guild.channels.cache.find(
+      c => c.isTextBased() && c.name.toLowerCase().includes(kw.toLowerCase())
+    );
+    if (found) return found;
+  }
+  return null;
+}
+
+function buildModernEmbed({ title, description, color, author, guildName, image, thumbnail, footerText }) {
+  const hexRegex = /^#[0-9A-Fa-f]{6}$/;
+  const safeColor = color && hexRegex.test(color) ? color : CONFIG.COLOR;
+
+  const embed = new EmbedBuilder()
+    .setColor(safeColor)
+    .setTimestamp();
+
+  if (title) embed.setTitle(title);
+  if (description) embed.setDescription(description);
+  if (author) {
+    embed.setAuthor({
+      name: author.username,
+      iconURL: author.displayAvatarURL({ dynamic: true }),
+    });
+  }
+  if (thumbnail && /^https?:\/\//i.test(thumbnail)) {
+    embed.setThumbnail(thumbnail);
+  }
+  if (image && /^https?:\/\//i.test(image)) {
+    embed.setImage(image);
+  }
+  embed.setFooter({
+    text: footerText || `${guildName || 'Viserion'} • Viserion Modern Embed`,
+  });
+
+  return embed;
+}
+
+function buildPartnerAnnouncementEmbed(author, content, stats) {
+  return new EmbedBuilder()
+    .setColor('#E91E63')
+    .setAuthor({
+      name: `${author.username} • Yeni Partnerlik`,
+      iconURL: author.displayAvatarURL({ dynamic: true }),
+    })
+    .setDescription(content)
+    .addFields(
+      { name: '📅 Bugün', value: `\`${stats.today}\` partner`, inline: true },
+      { name: '📆 Bu Hafta', value: `\`${stats.week}\` partner`, inline: true },
+      { name: '🗓️ Bu Ay', value: `\`${stats.month}\` partner`, inline: true }
+    )
+    .setFooter({ text: `Partneri Yapan: ${author.tag} • Toplam: ${stats.total}` })
+    .setTimestamp();
+}
+
+function buildPermanentPartnerEmbed(author, content) {
+  return new EmbedBuilder()
+    .setColor('#F1C40F')
+    .setTitle('💎 Kalıcı Partnerlik')
+    .setDescription(content)
+    .setAuthor({
+      name: author.username,
+      iconURL: author.displayAvatarURL({ dynamic: true }),
+    })
+    .setFooter({ text: `Yönetici Onaylı Kalıcı Partner • ${author.tag}` })
+    .setTimestamp();
+}
+
+// ==================== İSTEMCİ OLUŞTURMA ====================
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildVoiceStates,
+  ],
+  partials: [Partials.Channel, Partials.Message],
+});
+
+// ==================== SLASH KOMUT TANIMLARI ====================
+const slashCommands = [
+  new SlashCommandBuilder().setName('help').setDescription('Viserion interaktif yardım menüsünü açar.'),
+  new SlashCommandBuilder().setName('ping').setDescription('Bot ve API gecikmesini gösterir.'),
+  new SlashCommandBuilder()
+    .setName('userinfo')
+    .setDescription('Kullanıcı bilgilerini gösterir.')
+    .addUserOption(o => o.setName('kullanici').setDescription('Hedef kullanıcı')),
+  new SlashCommandBuilder().setName('serverinfo').setDescription('Sunucu istatistiklerini gösterir.'),
+  new SlashCommandBuilder()
+    .setName('avatar')
+    .setDescription('Kullanıcının profil fotoğrafını gösterir.')
+    .addUserOption(o => o.setName('kullanici').setDescription('Hedef kullanıcı')),
+  new SlashCommandBuilder()
+    .setName('embed')
+    .setDescription('Özel modern embed mesaj oluşturur.')
+    .addStringOption(o => o.setName('baslik').setDescription('Embed başlığı').setRequired(true))
+    .addStringOption(o => o.setName('aciklama').setDescription('Embed açıklaması').setRequired(true))
+    .addStringOption(o => o.setName('renk').setDescription('Hex renk kodu örn: #5865F2'))
+    .addStringOption(o => o.setName('gorsel').setDescription('Büyük görsel URL adresi'))
+    .addStringOption(o => o.setName('kucukresim').setDescription('Sağ üst küçük resim URL adresi')),
+  new SlashCommandBuilder()
+    .setName('partner')
+    .setDescription('Partnerler kanalına duyuru + link atar ve bugün/hafta/ay istatistiği gösterir.')
+    .addStringOption(o => o.setName('icerik').setDescription('Partner duyurusu ve sunucu linki').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('kalici-partner')
+    .setDescription('Sadece yöneticiler: Kalıcı partner kanalına modern embed atar.')
+    .addStringOption(o => o.setName('icerik').setDescription('Kalıcı partner duyurusu ve linki').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName('blacklist-ekle')
+    .setDescription('Blackliste sunucu ismi veya link ekler.')
+    .addStringOption(o => o.setName('deger').setDescription('Engellenecek sunucu adı veya link').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('blacklist-kaldir')
+    .setDescription('Blacklistten değer kaldırır.')
+    .addStringOption(o => o.setName('deger').setDescription('Kaldırılacak değer').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('blacklist-liste').setDescription('Blacklistteki kayıtları listeler.'),
+  new SlashCommandBuilder()
+    .setName('clear')
+    .setDescription('Belirtilen sayıda mesajı siler (1-100).')
+    .addIntegerOption(o => o.setName('adet').setDescription('Sayı').setMinValue(1).setMaxValue(100).setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+  new SlashCommandBuilder()
+    .setName('ban')
+    .setDescription('Kullanıcıyı sunucudan yasaklar.')
+    .addUserOption(o => o.setName('kullanici').setDescription('Yasaklanacak kişi').setRequired(true))
+    .addStringOption(o => o.setName('sebep').setDescription('Sebep'))
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+  new SlashCommandBuilder()
+    .setName('kick')
+    .setDescription('Kullanıcıyı sunucudan atar.')
+    .addUserOption(o => o.setName('kullanici').setDescription('Atılacak kişi').setRequired(true))
+    .addStringOption(o => o.setName('sebep').setDescription('Sebep'))
+    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
+  new SlashCommandBuilder()
+    .setName('warn')
+    .setDescription('Kullanıcıya uyarı verir.')
+    .addUserOption(o => o.setName('kullanici').setDescription('Uyarılacak kişi').setRequired(true))
+    .addStringOption(o => o.setName('sebep').setDescription('Uyarı sebebi').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+  new SlashCommandBuilder()
+    .setName('rank')
+    .setDescription('Seviye ve XP kartını gösterir.')
+    .addUserOption(o => o.setName('kullanici').setDescription('Hedef kullanıcı')),
+  new SlashCommandBuilder().setName('balance').setDescription('Cüzdan bakiyeni gösterir.'),
+  new SlashCommandBuilder().setName('daily').setDescription('Günlük ödülünü alırsın.'),
+  new SlashCommandBuilder()
+    .setName('coinflip')
+    .setDescription('Yazı tura ile bahis oynarsın.')
+    .addIntegerOption(o => o.setName('miktar').setDescription('Bahis miktarı').setMinValue(10).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('poll')
+    .setDescription('Butonlu Evet/Hayır anketi başlatır.')
+    .addStringOption(o => o.setName('soru').setDescription('Anket sorusu').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('giveaway')
+    .setDescription('Butonlu çekiliş başlatır.')
+    .addIntegerOption(o => o.setName('saniye').setDescription('Süre (saniye)').setMinValue(10).setRequired(true))
+    .addStringOption(o => o.setName('odul').setDescription('Çekiliş ödülü').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('ticket-kur')
+    .setDescription('Bulunduğun kanala destek talebi (Ticket) paneli kurar.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+];
+
+// ==================== YARDIMCI FONKSİYONLAR ====================
+async function sendLog(guild, title, description, color = '#E67E22') {
+  const logCh = guild.channels.cache.find(c => c.name === CONFIG.LOG_CHANNEL_NAME && c.isTextBased());
+  if (!logCh) return;
+  const embed = new EmbedBuilder().setColor(color).setTitle(title).setDescription(description).setTimestamp();
+  await logCh.send({ embeds: [embed] }).catch(() => {});
+}
+
+async function sendPartnerLog(guild, title, description, color = '#E91E63') {
+  const pLogCh = resolveChannel(guild, CONFIG.CHANNELS.PARTNER_LOG_ID, ['partner', 'log']);
+  if (!pLogCh) return;
+  const embed = new EmbedBuilder().setColor(color).setTitle(title).setDescription(description).setTimestamp();
+  await pLogCh.send({ embeds: [embed] }).catch(() => {});
+}
+
+function buildHelpUI() {
+  const embed = new EmbedBuilder()
+    .setColor(CONFIG.COLOR)
+    .setTitle('🐉 Viserion — A’dan Z’ye Kontrol Paneli')
+    .setDescription(
+      `Prefix: \`${CONFIG.PREFIX}\` | Slash Komutları: \`/\`\nAşağıdaki menüden kategori seçerek tüm komutları inceleyebilirsin.`
+    )
+    .addFields(
+      { name: '🤝 Partner & Blacklist', value: '`partner`, `kalici-partner`, `blacklist-ekle`, `blacklist-kaldir`, `blacklist-liste`', inline: false },
+      { name: '🛡️ Moderasyon', value: '`ban`, `kick`, `warn`, `clear`, `ticket-kur`', inline: true },
+      { name: '📊 Bilgi & Embed', value: '`help`, `ping`, `userinfo`, `serverinfo`, `avatar`, `embed`', inline: true },
+      { name: '🎮 Ekonomi & Etkileşim', value: '`rank`, `balance`, `daily`, `coinflip`, `poll`, `giveaway`', inline: true }
+    )
+    .setFooter({ text: 'Viserion Modern Bot Sistemi' });
+
+  const menu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('help_category')
+      .setPlaceholder('📂 Detaylı kategori seç...')
+      .addOptions([
+        { label: 'Partner & Blacklist', value: 'partner', emoji: '🤝', description: 'Partner duyuru, kalıcı partner ve blacklist' },
+        { label: 'Moderasyon Komutları', value: 'mod', emoji: '🛡️', description: 'Ban, kick, warn, clear ve ticket sistemi' },
+        { label: 'Ekonomi & Seviye', value: 'eco', emoji: '💰', description: 'XP, level, günlük ödül ve bahis' },
+        { label: 'Etkileşim & Çekiliş', value: 'fun', emoji: '🎉', description: 'Butonlu anket ve çekiliş araçları' },
+        { label: 'Bilgi & Embed', value: 'info', emoji: 'ℹ️', description: 'Sunucu, kullanıcı, embed ve gecikme bilgileri' },
+      ])
+  );
+
+  return { embeds: [embed], components: [menu] };
+}
+
+// ==================== BOT HAZIR OLDUĞUNDA ====================
+client.once('clientReady', async () => {
+  console.log(`🔥 ${client.user.tag} aktif! Prefix: ${CONFIG.PREFIX}`);
+  client.user.setPresence({
+    activities: [{ name: `${CONFIG.PREFIX}help | /help • Viserion`, type: ActivityType.Playing }],
+    status: 'online',
+  });
+
+  await client.application.commands.set(slashCommands.map(c => c.toJSON()));
+  console.log(`✅ ${slashCommands.length} Slash komutu senkronize edildi.`);
+});
+
+// ==================== KARŞILAMA SİSTEMİ ====================
+client.on('guildMemberAdd', async member => {
+  const ch = member.guild.channels.cache.find(c => c.name === CONFIG.WELCOME_CHANNEL_NAME && c.isTextBased());
+  if (!ch) return;
+
+  const embed = new EmbedBuilder()
+    .setColor('#2ECC71')
+    .setTitle('🐉 Aramıza Hoş Geldin!')
+    .setDescription(`${member} sunucuya katıldı! Seninle birlikte **${member.guild.memberCount}** kişiyiz.`)
+    .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+    .setTimestamp();
+
+  await ch.send({ embeds: [embed] }).catch(() => {});
+});
+
+// ==================== MESAJ & SEVİYE & PARTNER KORUMA & PREFIX KOMUTLARI ====================
+client.on('messageCreate', async message => {
+  if (message.author.bot || !message.guild) return;
+
+  const partnerChannel = resolveChannel(message.guild, CONFIG.CHANNELS.PARTNER_ID, ['partnerler']);
+  const isInPartnerChannel = partnerChannel && message.channel.id === partnerChannel.id;
+  const isPrefixCommand = message.content.startsWith(CONFIG.PREFIX);
+
+  // --- Partnerler Kanalında Blacklist Kontrolü & Doğrudan Duyuru Yakalama ---
+  if (isInPartnerChannel) {
+    const blockedTerm = findBlacklistedTerm(message.guild.id, message.content);
+    if (blockedTerm) {
+      await message.delete().catch(() => {});
+      const warnMsg = await message.channel.send(
+        `🚫 ${message.author}, **\`${blockedTerm}\`** blacklist'te bulunduğu için bu partner duyurusu/linki engellendi!`
+      );
+      setTimeout(() => warnMsg.delete().catch(() => {}), 6000);
+      await sendPartnerLog(
+        message.guild,
+        '🚫 Blacklist Engellendi',
+        `**Kullanıcı:** ${message.author.tag} (\`${message.author.id}\`)\n**Eşleşen Kayıt:** \`${blockedTerm}\`\n**İçerik:** ${message.content}`,
+        '#E74C3C'
+      );
+      return;
+    }
+
+    if (!isPrefixCommand && /(discord\.gg\/|discord\.com\/invite\/|https?:\/\/)/i.test(message.content)) {
+      const content = message.content.trim();
+      await message.delete().catch(() => {});
+      const stats = recordPartnerAndGetStats(message.guild.id, message.author.id);
+      const embed = buildPartnerAnnouncementEmbed(message.author, content, stats);
+      await message.channel.send({ embeds: [embed] });
+      await sendPartnerLog(
+        message.guild,
+        '🤝 Partner Duyurusu Paylaşıldı',
+        `**Yetkili:** ${message.author.tag}\n**Bugün/Hafta/Ay:** ${stats.today}/${stats.week}/${stats.month}\n**İçerik:** ${content}`
+      );
+      return;
+    }
+  }
+
+  // --- Otomatik XP / Seviye Sistemi ---
+  const userXP = getXP(message.author.id);
+  userXP.xp += Math.floor(Math.random() * 10) + 5;
+  const needed = userXP.level * 100;
+  if (userXP.xp >= needed) {
+    userXP.xp -= needed;
+    userXP.level += 1;
+    message.channel
+      .send(`🎉 Tebrikler ${message.author}, **Seviye ${userXP.level}** oldun!`)
+      .then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
+  }
+
+  // --- Prefix Kontrolü ---
+  if (!isPrefixCommand) return;
+  const args = message.content.slice(CONFIG.PREFIX.length).trim().split(/\s+/);
+  const cmd = args.shift()?.toLowerCase();
+  if (!cmd) return;
+
+  try {
+    // PARTNER KOMUTU
+    if (cmd === 'partner') {
+      const content = args.join(' ').trim();
+      if (!content) return message.reply('❌ Kullanım: `v!partner <duyuru metni ve sunucu linki>`');
+
+      const blockedTerm = findBlacklistedTerm(message.guild.id, content);
+      if (blockedTerm) {
+        await sendPartnerLog(
+          message.guild,
+          '🚫 Blacklist Engellendi (v!partner)',
+          `**Kullanıcı:** ${message.author.tag}\n**Eşleşen Kayıt:** \`${blockedTerm}\`\n**İçerik:** ${content}`,
+          '#E74C3C'
+        );
+        return message.reply(`🚫 **\`${blockedTerm}\`** blacklist'te yer aldığı için bu partner gönderilemez!`);
+      }
+
+      const targetCh = partnerChannel || message.channel;
+      const stats = recordPartnerAndGetStats(message.guild.id, message.author.id);
+      const embed = buildPartnerAnnouncementEmbed(message.author, content, stats);
+      await targetCh.send({ embeds: [embed] });
+      await sendPartnerLog(
+        message.guild,
+        '🤝 Partner Duyurusu (v!partner)',
+        `**Yetkili:** ${message.author.tag}\n**Bugün/Hafta/Ay:** ${stats.today}/${stats.week}/${stats.month}\n**İçerik:** ${content}`
+      );
+      if (targetCh.id !== message.channel.id) {
+        return message.reply(
+          `✅ Partner duyurusu ${targetCh} kanalına gönderildi! (Bugün: **${stats.today}** | Bu Hafta: **${stats.week}** | Bu Ay: **${stats.month}**)`
+        );
+      }
+      return;
+    }
+
+    // KALICI PARTNER KOMUTU (SADECE YÖNETİCİ)
+    if (cmd === 'kalici-partner' || cmd === 'kalicipartner') {
+      if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return message.reply('❌ Bu komutu yalnızca **Yöneticiler** kullanabilir.');
+      }
+      const content = args.join(' ').trim();
+      if (!content) return message.reply('❌ Kullanım: `v!kalici-partner <duyuru metni ve sunucu linki>`');
+
+      const kaliciCh = resolveChannel(message.guild, CONFIG.CHANNELS.KALICI_ID, ['kalıcı', 'kalici']);
+      if (!kaliciCh) {
+        return message.reply('❌ Sunucuda `kalıcı` kanalı bulunamadı.');
+      }
+
+      const embed = buildPermanentPartnerEmbed(message.author, content);
+      await kaliciCh.send({ embeds: [embed] });
+      await sendPartnerLog(
+        message.guild,
+        '💎 Kalıcı Partner Eklendi',
+        `**Yönetici:** ${message.author.tag}\n**Kanal:** ${kaliciCh}\n**İçerik:** ${content}`,
+        '#F1C40F'
+      );
+      return message.reply(`✅ Kalıcı partner mesajı ${kaliciCh} kanalına modern embed ile gönderildi.`);
+    }
+
+    // BLACKLIST EKLE
+    if (cmd === 'blacklist-ekle' || cmd === 'blekle') {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild) && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return message.reply('❌ Blacklist yönetmek için yetkin yok.');
+      }
+      const term = args.join(' ').trim().toLowerCase();
+      if (!term) return message.reply('❌ Kullanım: `v!blacklist-ekle <sunucu ismi veya link>`');
+
+      getBlacklist(message.guild.id).add(term);
+
+      const blCh = resolveChannel(message.guild, CONFIG.CHANNELS.BLACKLIST_ID, ['blacklist']);
+      if (blCh) {
+        const blEmbed = new EmbedBuilder()
+          .setColor('#E74C3C')
+          .setTitle('⛔ Blacklist Kaydı Eklendi')
+          .addFields(
+            { name: 'Engellenen İsim / Link', value: `\`${term}\``, inline: true },
+            { name: 'Ekleyen Yetkili', value: `${message.author.tag}`, inline: true }
+          )
+          .setTimestamp();
+        await blCh.send({ embeds: [blEmbed] }).catch(() => {});
+      }
+
+      return message.reply(`⛔ **\`${term}\`** blacklist'e eklendi. Artık \`partnerler\` kanalında engellenecek.`);
+    }
+
+    // BLACKLIST KALDIR
+    if (cmd === 'blacklist-kaldir' || cmd === 'blkaldir') {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild) && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return message.reply('❌ Blacklist yönetmek için yetkin yok.');
+      }
+      const term = args.join(' ').trim().toLowerCase();
+      if (!term) return message.reply('❌ Kullanım: `v!blacklist-kaldir <sunucu ismi veya link>`');
+      const removed = getBlacklist(message.guild.id).delete(term);
+      return message.reply(removed ? `✅ **\`${term}\`** blacklist'ten kaldırıldı.` : '❌ Bu kayıt blacklist\'te bulunamadı.');
+    }
+
+    // BLACKLIST LİSTE
+    if (cmd === 'blacklist-liste' || cmd === 'blliste') {
+      const list = [...getBlacklist(message.guild.id)];
+      if (!list.length) return message.reply('📋 Blacklist şu an boş.');
+      const embed = new EmbedBuilder()
+        .setColor('#E74C3C')
+        .setTitle('📋 Sunucu Blacklist Listesi')
+        .setDescription(list.map((item, idx) => `**${idx + 1}.** \`${item}\``).join('\n'));
+      return message.reply({ embeds: [embed] });
+    }
+
+    // MODERN EMBED (v!embed Başlık | Açıklama | #Renk | GörselURL)
+    if (cmd === 'embed') {
+      const raw = args.join(' ');
+      const [title, desc, colorInput, imageInput] = raw.split('|').map(s => s?.trim());
+      if (!title || !desc) {
+        return message.reply('❌ Kullanım: `v!embed Başlık | Açıklama | #5865F2 | GörselURL(opsiyonel)`');
+      }
+      const embed = buildModernEmbed({
+        title,
+        description: desc,
+        color: colorInput,
+        author: message.author,
+        guildName: message.guild.name,
+        image: imageInput,
+      });
+      return message.channel.send({ embeds: [embed] });
+    }
+
+    // HELP
+    if (cmd === 'help' || cmd === 'yardim') {
+      return message.reply(buildHelpUI());
+    }
+
+    // PING
+    if (cmd === 'ping') {
+      const sent = await message.reply('🏓 Ölçülüyor...');
+      return sent.edit(
+        `🏓 **Viserion Gecikme:** Mesaj \`${sent.createdTimestamp - message.createdTimestamp}ms\` | API \`${Math.round(client.ws.ping)}ms\``
+      );
+    }
+
+    // AVATAR
+    if (cmd === 'avatar' || cmd === 'av') {
+      const user = message.mentions.users.first() || message.author;
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setTitle(`${user.username} Avatarı`)
+        .setImage(user.displayAvatarURL({ dynamic: true, size: 512 }));
+      return message.reply({ embeds: [embed] });
+    }
+
+    // USERINFO
+    if (cmd === 'userinfo' || cmd === 'ui') {
+      const user = message.mentions.users.first() || message.author;
+      const member = await message.guild.members.fetch(user.id).catch(() => null);
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setAuthor({ name: user.tag, iconURL: user.displayAvatarURL() })
+        .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+        .addFields(
+          { name: 'ID', value: `\`${user.id}\``, inline: true },
+          { name: 'Hesap Tarihi', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:R>`, inline: true },
+          {
+            name: 'Katılım Tarihi',
+            value: member?.joinedTimestamp ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : 'Yok',
+            inline: true,
+          }
+        );
+      return message.reply({ embeds: [embed] });
+    }
+
+    // SERVERINFO
+    if (cmd === 'serverinfo' || cmd === 'si') {
+      const g = message.guild;
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setTitle(`🏰 ${g.name}`)
+        .setThumbnail(g.iconURL({ dynamic: true }))
+        .addFields(
+          { name: 'Üye Sayısı', value: `\`${g.memberCount}\``, inline: true },
+          { name: 'Kanal Sayısı', value: `\`${g.channels.cache.size}\``, inline: true },
+          { name: 'Rol Sayısı', value: `\`${g.roles.cache.size}\``, inline: true },
+          { name: 'Kuruluş', value: `<t:${Math.floor(g.createdTimestamp / 1000)}:D>`, inline: true }
+        );
+      return message.reply({ embeds: [embed] });
+    }
+
+    // CLEAR
+    if (cmd === 'clear' || cmd === 'sil') {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages))
+        return message.reply('❌ **Mesajları Yönet** yetkin yok.');
+      const count = parseInt(args[0], 10);
+      if (!count || count < 1 || count > 100) return message.reply('❌ Kullanım: `v!clear <1-100>`');
+      const deleted = await message.channel.bulkDelete(count, true);
+      const m = await message.channel.send(`🧹 **${deleted.size}** mesaj temizlendi.`);
+      return setTimeout(() => m.delete().catch(() => {}), 3000);
+    }
+
+    // BAN
+    if (cmd === 'ban') {
+      if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
+        return message.reply('❌ **Üyeleri Yasakla** yetkin yok.');
+      const target = message.mentions.members.first();
+      if (!target) return message.reply('❌ Kullanım: `v!ban @kullanici [sebep]`');
+      if (!target.bannable) return message.reply('❌ Bu kullanıcıyı yasaklayamıyorum.');
+      const reason = args.slice(1).join(' ') || 'Sebep belirtilmedi';
+      await target.ban({ reason });
+      await sendLog(message.guild, '🔨 Kullanıcı Yasaklandı', `**Hedef:** ${target.user.tag}\n**Yetkili:** ${message.author.tag}\n**Sebep:** ${reason}`);
+      return message.reply(`🔨 **${target.user.tag}** yasaklandı. Sebep: *${reason}*`);
+    }
+
+    // KICK
+    if (cmd === 'kick') {
+      if (!message.member.permissions.has(PermissionFlagsBits.KickMembers))
+        return message.reply('❌ **Üyeleri At** yetkin yok.');
+      const target = message.mentions.members.first();
+      if (!target) return message.reply('❌ Kullanım: `v!kick @kullanici [sebep]`');
+      if (!target.kickable) return message.reply('❌ Bu kullanıcıyı atamıyorum.');
+      const reason = args.slice(1).join(' ') || 'Sebep belirtilmedi';
+      await target.kick(reason);
+      await sendLog(message.guild, '👢 Kullanıcı Atıldı', `**Hedef:** ${target.user.tag}\n**Yetkili:** ${message.author.tag}\n**Sebep:** ${reason}`);
+      return message.reply(`👢 **${target.user.tag}** sunucudan atıldı. Sebep: *${reason}*`);
+    }
+
+    // WARN
+    if (cmd === 'warn' || cmd === 'uyar') {
+      if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
+        return message.reply('❌ Yetkin yetersiz.');
+      const target = message.mentions.users.first();
+      const reason = args.slice(1).join(' ');
+      if (!target || !reason) return message.reply('❌ Kullanım: `v!warn @kullanici <sebep>`');
+      const key = `${message.guild.id}_${target.id}`;
+      const list = db.warnings.get(key) || [];
+      list.push({ reason, mod: message.author.tag, date: new Date().toLocaleDateString('tr-TR') });
+      db.warnings.set(key, list);
+      return message.reply(`⚠️ **${target.tag}** uyarıldı! (Toplam Uyarı: **${list.length}**) — Sebep: *${reason}*`);
+    }
+
+    // RANK
+    if (cmd === 'rank' || cmd === 'seviye') {
+      const target = message.mentions.users.first() || message.author;
+      const data = getXP(target.id);
+      const embed = new EmbedBuilder()
+        .setColor('#9B59B6')
+        .setTitle(`📈 ${target.username} Seviye Kartı`)
+        .addFields(
+          { name: 'Seviye', value: `\`${data.level}\``, inline: true },
+          { name: 'XP', value: `\`${data.xp} / ${data.level * 100}\``, inline: true }
+        );
+      return message.reply({ embeds: [embed] });
+    }
+
+    // BALANCE
+    if (cmd === 'balance' || cmd === 'bakiye' || cmd === 'bal') {
+      const eco = getEco(message.author.id);
+      return message.reply(`💰 Cüzdan bakiyen: **${eco.balance} Viserion Coin**`);
+    }
+
+    // DAILY
+    if (cmd === 'daily' || cmd === 'gunluk') {
+      const eco = getEco(message.author.id);
+      const now = Date.now();
+      const cooldown = 24 * 60 * 60 * 1000;
+      if (now - eco.lastDaily < cooldown) {
+        const kalanSaat = Math.ceil((cooldown - (now - eco.lastDaily)) / (1000 * 60 * 60));
+        return message.reply(`⏳ Günlük ödülünü zaten aldın! **${kalanSaat} saat** sonra tekrar dene.`);
+      }
+      eco.balance += 250;
+      eco.lastDaily = now;
+      return message.reply(`🎁 Günlük **250 Viserion Coin** hesabına eklendi! Yeni bakiye: **${eco.balance}**`);
+    }
+
+    // COINFLIP
+    if (cmd === 'coinflip' || cmd === 'cf') {
+      const amount = parseInt(args[0], 10);
+      const eco = getEco(message.author.id);
+      if (!amount || amount < 10) return message.reply('❌ Kullanım: `v!cf <miktar>` (En az 10)');
+      if (eco.balance < amount) return message.reply('❌ Yetersiz bakiye!');
+      const win = Math.random() < 0.5;
+      if (win) {
+        eco.balance += amount;
+        return message.reply(`🪙 Kazandın! **+${amount}** coin. Güncel bakiye: **${eco.balance}**`);
+      } else {
+        eco.balance -= amount;
+        return message.reply(`🪙 Kaybettin! **-${amount}** coin. Güncel bakiye: **${eco.balance}**`);
+      }
+    }
+
+    // TICKET KUR
+    if (cmd === 'ticket-kur') {
+      if (!message.member.permissions.has(PermissionFlagsBits.Administrator))
+        return message.reply('❌ Sadece yöneticiler ticket paneli kurabilir.');
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setTitle('🎫 Viserion Destek Sistemi')
+        .setDescription('Yetkililerle iletişime geçmek için aşağıdaki **Destek Talebi Oluştur** butonuna tıkla.');
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('create_ticket').setLabel('Destek Talebi Oluştur').setEmoji('🎫').setStyle(ButtonStyle.Primary)
+      );
+      return message.channel.send({ embeds: [embed], components: [row] });
+    }
+  } catch (err) {
+    console.error(err);
+    message.reply('❌ Komut çalıştırılırken bir hata oluştu.');
+  }
+});
+
+// ==================== INTERACTION (SLASH + BUTON + SELECT MENU) ====================
+client.on('interactionCreate', async interaction => {
+  // --- 1. Select Menu (Help Kategorileri) ---
+  if (interaction.isStringSelectMenu() && interaction.customId === 'help_category') {
+    const val = interaction.values[0];
+    const details = {
+      partner: '🤝 **Partner & Blacklist:**\n`/partner`, `/kalici-partner` (Sadece Yönetici), `/blacklist-ekle`, `/blacklist-kaldir`, `/blacklist-liste`',
+      mod: '🛡️ **Moderasyon:**\n`/ban`, `/kick`, `/warn`, `/clear`, `/ticket-kur` (ve `v!` karşılıkları)',
+      eco: '💰 **Ekonomi & Seviye:**\n`/rank`, `/balance`, `/daily`, `/coinflip` (Mesaj attıkça otomatik XP kazanılır)',
+      fun: '🎉 **Etkileşim:**\n`/poll <soru>` ile canlı butonlu anket, `/giveaway <saniye> <ödül>` ile çekiliş başlat.',
+      info: 'ℹ️ **Bilgi & Embed:**\n`/ping`, `/userinfo`, `/serverinfo`, `/avatar`, `/embed`',
+    };
+    return interaction.reply({ content: details[val], ephemeral: true });
+  }
+
+  // --- 2. Ticket Butonları ---
+  if (interaction.isButton()) {
+    if (interaction.customId === 'create_ticket') {
+      const existing = interaction.guild.channels.cache.find(c => c.name === `ticket-${interaction.user.username.toLowerCase()}`);
+      if (existing) return interaction.reply({ content: `❌ Zaten açık bir talebin var: ${existing}`, ephemeral: true });
+
+      const ticketChannel = await interaction.guild.channels.create({
+        name: `ticket-${interaction.user.username}`,
+        type: ChannelType.GuildText,
+        permissionOverwrites: [
+          { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+          { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+        ],
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor('#2ECC71')
+        .setTitle('🎫 Destek Talebi Açıldı')
+        .setDescription(`Merhaba ${interaction.user}, sorununuzu buraya yazabilirsiniz. Kapatmak için aşağıdaki butonu kullanın.`);
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('close_ticket').setLabel('Talebi Kapat').setEmoji('🔒').setStyle(ButtonStyle.Danger)
+      );
+
+      await ticketChannel.send({ embeds: [embed], components: [row] });
+      return interaction.reply({ content: `✅ Destek kanalın oluşturuldu: ${ticketChannel}`, ephemeral: true });
+    }
+
+    if (interaction.customId === 'close_ticket') {
+      await interaction.reply('🔒 Ticket 3 saniye içinde kapatılıyor...');
+      return setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
+    }
+  }
+
+  // --- 3. Slash Komutları ---
+  if (!interaction.isChatInputCommand()) return;
+  const { commandName } = interaction;
+
+  try {
+    if (commandName === 'partner') {
+      const content = interaction.options.getString('icerik').trim();
+      const blockedTerm = findBlacklistedTerm(interaction.guild.id, content);
+      if (blockedTerm) {
+        await sendPartnerLog(
+          interaction.guild,
+          '🚫 Blacklist Engellendi (/partner)',
+          `**Kullanıcı:** ${interaction.user.tag}\n**Eşleşen Kayıt:** \`${blockedTerm}\`\n**İçerik:** ${content}`,
+          '#E74C3C'
+        );
+        return interaction.reply({ content: `🚫 **\`${blockedTerm}\`** blacklist'te bulunduğu için bu partner gönderilemez!`, ephemeral: true });
+      }
+
+      const partnerCh = resolveChannel(interaction.guild, CONFIG.CHANNELS.PARTNER_ID, ['partnerler']) || interaction.channel;
+      const stats = recordPartnerAndGetStats(interaction.guild.id, interaction.user.id);
+      const embed = buildPartnerAnnouncementEmbed(interaction.user, content, stats);
+      await partnerCh.send({ embeds: [embed] });
+      await sendPartnerLog(
+        interaction.guild,
+        '🤝 Partner Duyurusu (/partner)',
+        `**Yetkili:** ${interaction.user.tag}\n**Bugün/Hafta/Ay:** ${stats.today}/${stats.week}/${stats.month}\n**İçerik:** ${content}`
+      );
+      return interaction.reply({ content: `✅ Partner duyurusu ${partnerCh} kanalına gönderildi!`, ephemeral: true });
+    }
+
+    if (commandName === 'kalici-partner') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ content: '❌ Bu komutu yalnızca **Yöneticiler** kullanabilir.', ephemeral: true });
+      }
+      const content = interaction.options.getString('icerik').trim();
+      const kaliciCh = resolveChannel(interaction.guild, CONFIG.CHANNELS.KALICI_ID, ['kalıcı', 'kalici']);
+      if (!kaliciCh) {
+        return interaction.reply({ content: '❌ Sunucuda `kalıcı` kanalı bulunamadı.', ephemeral: true });
+      }
+      const embed = buildPermanentPartnerEmbed(interaction.user, content);
+      await kaliciCh.send({ embeds: [embed] });
+      await sendPartnerLog(
+        interaction.guild,
+        '💎 Kalıcı Partner Eklendi (/kalici-partner)',
+        `**Yönetici:** ${interaction.user.tag}\n**Kanal:** ${kaliciCh}\n**İçerik:** ${content}`,
+        '#F1C40F'
+      );
+      return interaction.reply({ content: `✅ Kalıcı partner mesajı ${kaliciCh} kanalına gönderildi.`, ephemeral: true });
+    }
+
+    if (commandName === 'blacklist-ekle') {
+      const term = interaction.options.getString('deger').trim().toLowerCase();
+      getBlacklist(interaction.guild.id).add(term);
+      const blCh = resolveChannel(interaction.guild, CONFIG.CHANNELS.BLACKLIST_ID, ['blacklist']);
+      if (blCh) {
+        const blEmbed = new EmbedBuilder()
+          .setColor('#E74C3C')
+          .setTitle('⛔ Blacklist Kaydı Eklendi')
+          .addFields(
+            { name: 'Engellenen İsim / Link', value: `\`${term}\``, inline: true },
+            { name: 'Ekleyen Yetkili', value: `${interaction.user.tag}`, inline: true }
+          )
+          .setTimestamp();
+        await blCh.send({ embeds: [blEmbed] }).catch(() => {});
+      }
+      return interaction.reply({ content: `⛔ **\`${term}\`** blacklist'e eklendi.`, ephemeral: true });
+    }
+
+    if (commandName === 'blacklist-kaldir') {
+      const term = interaction.options.getString('deger').trim().toLowerCase();
+      const removed = getBlacklist(interaction.guild.id).delete(term);
+      return interaction.reply({ content: removed ? `✅ **\`${term}\`** kaldırıldı.` : '❌ Kayıt bulunamadı.', ephemeral: true });
+    }
+
+    if (commandName === 'blacklist-liste') {
+      const list = [...getBlacklist(interaction.guild.id)];
+      if (!list.length) return interaction.reply({ content: '📋 Blacklist boş.', ephemeral: true });
+      const embed = new EmbedBuilder()
+        .setColor('#E74C3C')
+        .setTitle('📋 Sunucu Blacklist Listesi')
+        .setDescription(list.map((item, idx) => `**${idx + 1}.** \`${item}\``).join('\n'));
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    if (commandName === 'embed') {
+      const title = interaction.options.getString('baslik');
+      const desc = interaction.options.getString('aciklama');
+      const colorOpt = interaction.options.getString('renk');
+      const imageOpt = interaction.options.getString('gorsel');
+      const thumbOpt = interaction.options.getString('kucukresim');
+
+      const embed = buildModernEmbed({
+        title,
+        description: desc,
+        color: colorOpt,
+        author: interaction.user,
+        guildName: interaction.guild.name,
+        image: imageOpt,
+        thumbnail: thumbOpt,
+      });
+
+      await interaction.channel.send({ embeds: [embed] });
+      return interaction.reply({ content: '✅ Modern embed oluşturuldu.', ephemeral: true });
+    }
+
+    if (commandName === 'help') return interaction.reply(buildHelpUI());
+
+    if (commandName === 'ping') {
+      return interaction.reply(`🏓 **Viserion API Gecikmesi:** \`${Math.round(client.ws.ping)}ms\``);
+    }
+
+    if (commandName === 'avatar') {
+      const user = interaction.options.getUser('kullanici') || interaction.user;
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setTitle(`${user.username} Avatarı`)
+        .setImage(user.displayAvatarURL({ dynamic: true, size: 512 }));
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'userinfo') {
+      const user = interaction.options.getUser('kullanici') || interaction.user;
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setAuthor({ name: user.tag, iconURL: user.displayAvatarURL() })
+        .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+        .addFields(
+          { name: 'ID', value: `\`${user.id}\``, inline: true },
+          { name: 'Hesap Tarihi', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:R>`, inline: true },
+          {
+            name: 'Katılım Tarihi',
+            value: member?.joinedTimestamp ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : 'Yok',
+            inline: true,
+          }
+        );
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'serverinfo') {
+      const g = interaction.guild;
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setTitle(`🏰 ${g.name}`)
+        .setThumbnail(g.iconURL({ dynamic: true }))
+        .addFields(
+          { name: 'Üye Sayısı', value: `\`${g.memberCount}\``, inline: true },
+          { name: 'Kanal Sayısı', value: `\`${g.channels.cache.size}\``, inline: true },
+          { name: 'Rol Sayısı', value: `\`${g.roles.cache.size}\``, inline: true }
+        );
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'clear') {
+      const count = interaction.options.getInteger('adet');
+      const deleted = await interaction.channel.bulkDelete(count, true);
+      return interaction.reply({ content: `🧹 **${deleted.size}** mesaj silindi.`, ephemeral: true });
+    }
+
+    if (commandName === 'ban') {
+      const user = interaction.options.getUser('kullanici');
+      const reason = interaction.options.getString('sebep') || 'Sebep belirtilmedi';
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (member && !member.bannable) return interaction.reply({ content: '❌ Bu kullanıcı yasaklanamıyor.', ephemeral: true });
+      await interaction.guild.members.ban(user.id, { reason });
+      await sendLog(interaction.guild, '🔨 Kullanıcı Yasaklandı', `**Hedef:** ${user.tag}\n**Yetkili:** ${interaction.user.tag}\n**Sebep:** ${reason}`);
+      return interaction.reply(`🔨 **${user.tag}** yasaklandı. Sebep: *${reason}*`);
+    }
+
+    if (commandName === 'kick') {
+      const user = interaction.options.getUser('kullanici');
+      const reason = interaction.options.getString('sebep') || 'Sebep belirtilmedi';
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member || !member.kickable) return interaction.reply({ content: '❌ Bu kullanıcı atılamıyor.', ephemeral: true });
+      await member.kick(reason);
+      await sendLog(interaction.guild, '👢 Kullanıcı Atıldı', `**Hedef:** ${user.tag}\n**Yetkili:** ${interaction.user.tag}\n**Sebep:** ${reason}`);
+      return interaction.reply(`👢 **${user.tag}** sunucudan atıldı. Sebep: *${reason}*`);
+    }
+
+    if (commandName === 'warn') {
+      const user = interaction.options.getUser('kullanici');
+      const reason = interaction.options.getString('sebep');
+      const key = `${interaction.guild.id}_${user.id}`;
+      const list = db.warnings.get(key) || [];
+      list.push({ reason, mod: interaction.user.tag, date: new Date().toLocaleDateString('tr-TR') });
+      db.warnings.set(key, list);
+      return interaction.reply(`⚠️ **${user.tag}** uyarıldı! (Toplam Uyarı: **${list.length}**) — Sebep: *${reason}*`);
+    }
+
+    if (commandName === 'rank') {
+      const user = interaction.options.getUser('kullanici') || interaction.user;
+      const data = getXP(user.id);
+      const embed = new EmbedBuilder()
+        .setColor('#9B59B6')
+        .setTitle(`📈 ${user.username} Seviye Kartı`)
+        .addFields(
+          { name: 'Seviye', value: `\`${data.level}\``, inline: true },
+          { name: 'XP', value: `\`${data.xp} / ${data.level * 100}\``, inline: true }
+        );
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'balance') {
+      const eco = getEco(interaction.user.id);
+      return interaction.reply(`💰 Cüzdan bakiyen: **${eco.balance} Viserion Coin**`);
+    }
+
+    if (commandName === 'daily') {
+      const eco = getEco(interaction.user.id);
+      const now = Date.now();
+      const cooldown = 24 * 60 * 60 * 1000;
+      if (now - eco.lastDaily < cooldown) {
+        const kalanSaat = Math.ceil((cooldown - (now - eco.lastDaily)) / (1000 * 60 * 60));
+        return interaction.reply({ content: `⏳ **${kalanSaat} saat** sonra tekrar alabilirsin.`, ephemeral: true });
+      }
+      eco.balance += 250;
+      eco.lastDaily = now;
+      return interaction.reply(`🎁 Günlük **250 Viserion Coin** eklendi! Yeni bakiye: **${eco.balance}**`);
+    }
+
+    if (commandName === 'coinflip') {
+      const amount = interaction.options.getInteger('miktar');
+      const eco = getEco(interaction.user.id);
+      if (eco.balance < amount) return interaction.reply({ content: '❌ Yetersiz bakiye!', ephemeral: true });
+      const win = Math.random() < 0.5;
+      eco.balance += win ? amount : -amount;
+      return interaction.reply(
+        win
+          ? `🪙 Kazandın! **+${amount}** coin. Güncel bakiye: **${eco.balance}**`
+          : `🪙 Kaybettin! **-${amount}** coin. Güncel bakiye: **${eco.balance}**`
+      );
+    }
+
+    if (commandName === 'poll') {
+      const question = interaction.options.getString('soru');
+      const votes = new Map();
+      const makeRow = (y, n, dis = false) =>
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('p_yes').setLabel(`Evet (${y})`).setStyle(ButtonStyle.Success).setDisabled(dis),
+          new ButtonBuilder().setCustomId('p_no').setLabel(`Hayır (${n})`).setStyle(ButtonStyle.Danger).setDisabled(dis)
+        );
+      const embed = new EmbedBuilder().setColor('#9B59B6').setTitle('📊 Anket').setDescription(`**${question}**`);
+      const msg = await interaction.reply({ embeds: [embed], components: [makeRow(0, 0)], fetchReply: true });
+
+      const collector = msg.createMessageComponentCollector({ componentType: ComponentType.Button, time: 300_000 });
+      collector.on('collect', async i => {
+        votes.set(i.user.id, i.customId);
+        const y = [...votes.values()].filter(v => v === 'p_yes').length;
+        const n = [...votes.values()].filter(v => v === 'p_no').length;
+        await i.update({ components: [makeRow(y, n)] });
+      });
+      collector.on('end', async () => {
+        const y = [...votes.values()].filter(v => v === 'p_yes').length;
+        const n = [...votes.values()].filter(v => v === 'p_no').length;
+        await msg.edit({ components: [makeRow(y, n, true)] }).catch(() => {});
+      });
+    }
+
+    if (commandName === 'giveaway') {
+      const sec = interaction.options.getInteger('saniye');
+      const prize = interaction.options.getString('odul');
+      const participants = new Set();
+
+      const embed = new EmbedBuilder()
+        .setColor('#F1C40F')
+        .setTitle('🎉 ÇEKİLİŞ BAŞLADI!')
+        .setDescription(`**Ödül:** ${prize}\n**Bitiş:** <t:${Math.floor((Date.now() + sec * 1000) / 1000)}:R>\nKatılmak için aşağıdaki butona tıkla!`);
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('gw_join').setLabel('Katıl (0)').setEmoji('🎉').setStyle(ButtonStyle.Primary)
+      );
+
+      const msg = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
+      const collector = msg.createMessageComponentCollector({ componentType: ComponentType.Button, time: sec * 1000 });
+
+      collector.on('collect', async i => {
+        if (participants.has(i.user.id)) {
+          return i.reply({ content: 'Zaten çekilişe katıldın!', ephemeral: true });
+        }
+        participants.add(i.user.id);
+        const updatedRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('gw_join').setLabel(`Katıl (${participants.size})`).setEmoji('🎉').setStyle(ButtonStyle.Primary)
+        );
+        await i.update({ components: [updatedRow] });
+      });
+
+      collector.on('end', async () => {
+        const list = [...participants];
+        const winner = list.length ? `<@${list[Math.floor(Math.random() * list.length)]}>` : 'Katılımcı olmadı';
+        const endEmbed = new EmbedBuilder()
+          .setColor('#2ECC71')
+          .setTitle('🎊 ÇEKİLİŞ SONA ERDİ!')
+          .setDescription(`**Ödül:** ${prize}\n**Kazanan:** ${winner}`);
+        await msg.edit({ embeds: [endEmbed], components: [] }).catch(() => {});
+      });
+    }
+
+    if (commandName === 'ticket-kur') {
+      const embed = new EmbedBuilder()
+        .setColor(CONFIG.COLOR)
+        .setTitle('🎫 Viserion Destek Sistemi')
+        .setDescription('Yetkililerle iletişime geçmek için aşağıdaki **Destek Talebi Oluştur** butonuna tıkla.');
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('create_ticket').setLabel('Destek Talebi Oluştur').setEmoji('🎫').setStyle(ButtonStyle.Primary)
+      );
+      await interaction.channel.send({ embeds: [embed], components: [row] });
+      return interaction.reply({ content: '✅ Ticket paneli kuruldu.', ephemeral: true });
+    }
+  } catch (err) {
+    console.error(err);
+    if (!interaction.replied) await interaction.reply({ content: '❌ Bir hata oluştu.', ephemeral: true });
+  }
+});
+
+client.login(CONFIG.TOKEN);
