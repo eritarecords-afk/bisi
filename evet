@@ -16,7 +16,7 @@ const {
 
 // ==================== AYARLAR ====================
 const CONFIG = {
-  TOKEN: 'MTUxMzk5NDk0NTU2MjY3NzMwOA.GPQWpt.O-35yRIA0AHPptuKK4_eYILUHvCnAYDKlBYW8A', // YENİLEDİĞİN TOKENI BURAYA YAZ
+  TOKEN: process.env.TOKEN, // Railway Variables icinde TOKEN olarak tanimla
   PREFIX: 'v!',
   COLOR: '#5865F2',
   WELCOME_CHANNEL_NAME: 'hoş-geldin',
