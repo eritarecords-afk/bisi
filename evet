@@ -16,7 +16,7 @@ const {
 
 // ==================== AYARLAR ====================
 const CONFIG = {
-  TOKEN: 'MTUxMzk5NDk0NTU2MjY3NzMwOA.GPQWpt.O-35yRIA0AHPptuKK4_eYILUHvCnAYDKlBYW8A', // YENİLEDİĞİN TOKENI BURAYA YAZ
+  TOKEN: 'MTUxMzk5NDk0NTU2MjY3NzMwOA.GE9QWU.4tleeLgT6J_1L0KjHtc3xv5dRDaw8dnBzRq8-Y', // YENİLEDİĞİN TOKENI BURAYA YAZ
   PREFIX: 'v!',
   COLOR: '#5865F2',
   WELCOME_CHANNEL_NAME: 'hoş-geldin',
